@@ -1,0 +1,123 @@
+---
+title: "machLearning"
+date: "5/15/2020"
+output: html_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+## Summary
+In this project I am analyzing data collected from sensors to determine weight lifting form. Six individuals lifted weights with different, instructed, techniques. This project will use modelling to predict what type of lifting form was used on new sensor data.
+
+# Loading in the data...
+```{r}
+set.seed(1)
+library(caret)
+library(rpart)
+library(ggplot2)
+Data=read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv")
+quizData=read.csv("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv")
+```
+
+
+# Cleaning data
+Partition the data into a training set, test set, and validation set.
+```{r}
+inTrain=createDataPartition(y=Data$classe,p=.60,list=F)
+training=Data[inTrain,]
+testing=Data[-inTrain,]
+
+inTest=createDataPartition(y=testing$classe,p=(25/40),list=F) #60/25/15
+testing=testing[inTest,]
+valid=testing[-inTest,]
+```
+
+Remove new windows, which represent only a handful of values.
+Remove rows with all N/As
+Remove rows with near zero variance
+And remove the first 6 columns which describe the samples and would not be predictive on a new data set.
+```{r}
+training=subset(training,new_window=="no")
+training=training[,apply(apply(training,2,complete.cases),2,mean)==TRUE]
+training=training[,-nearZeroVar(training)]
+trainNames=training$user_name
+training=training[,-1:-6]
+```
+
+I'm going to do a principle component analysis to try to learn more abou the data.
+```{r}
+PRC=prcomp(training[,-53],center=T,scale.=T)
+qplot(PRC$x[,1],PRC$x[,2],col=training$classe,alpha=.2) #color by classe
+```
+The graph of principle components 1 and 2 does neatly separate the data into 5 distinct groups but not in the way I was hoping for.
+```{r}
+qplot(PRC$x[,1],PRC$x[,2],col=trainNames,alpha=.2)      #color by user name
+```
+Apparently this analysis is quite effective in identifying 4 of the 6 study participants, unfortunately this is not helpful for this project.
+
+# Use multiple cores to save processing time
+```{r}
+library(doSNOW) 
+cl=makeCluster(8,type="SOCK")
+registerDoSNOW(cl)
+```
+
+# Fitting models
+I decided to try 6 different model types to test their effectiveness on this dataset.
+```{r}
+cTest=function(fit){ #save typing
+  confusionMatrix(predict(fit,testing),testing$classe)$overall[1]
+}
+fitRPART=train(classe~.,training,method="rpart")
+  paste("RPART accuracy:",cTest(fitRPART))
+fitLDA=train(classe~.,training,method="lda")               
+  paste("LDA accuracy:",cTest(fitLDA))
+fitSVML=train(classe~.,training,method='svmLinear')
+  paste("svmLinear accuracy:",cTest(fitSVML))
+fitSVMR=train(classe~.,training,method='svmRadial')
+  paste("svmRadial accuracy:",cTest(fitSVMR))
+fitGBM=train(classe~.,training,method="gbm",verbose=F) 
+  paste("GBM accuracy:",cTest(fitGBM))
+fitRF=train(classe~.,training,method='rf',verbose=F)
+  paste("RF accuracy:",cTest(fitRF))
+
+fitRF$finalModel
+```
+Of the above models the random forest method had the best results with >99% accuracy on the test set and <1% out of bag error rate which suggest this model should perform very well on new data.
+
+
+# Ensemble Model
+Next I wanted to try creating an ensemble model from the predictions of the above models. I create a dataframe of the predictions from each model on the testing partition and train two models on those predictions against the actual value.
+
+```{r}
+combinedModel.df=data.frame(
+  RF=predict(fitRF,testing),
+  GBM=predict(fitGBM,testing),
+  SVMR=predict(fitSVMR,testing),
+  SVML=predict(fitSVML,testing),
+  LDA=predict(fitLDA,testing),
+  RPART=predict(fitRPART,testing),
+  actual=testing$classe)
+
+comb=train(actual~RF+GBM+SVMR,combinedModel.df,method="rf") #train vs top algorithm predictions
+bigcomb=train(actual~.,combinedModel.df,method="rf") #train vs all algorithm predictions
+head(combinedModel.df)
+```
+
+The new model is used on the fits from the validation partition.
+```{r}
+val.df=data.frame(
+  RF=predict(fitRF,valid),
+  GBM=predict(fitGBM,valid),
+  SVMR=predict(fitSVMR,valid),
+  SVML=predict(fitSVML,valid),
+  LDA=predict(fitLDA,valid),
+  RPART=predict(fitRPART,valid))
+
+paste("RF fit accuracy:",confusionMatrix(predict(fitRF,newdata=valid),valid$classe)$overall[1]) #rf alone
+paste("Top algorithm fit accuracy:",confusionMatrix(predict(comb,val.df),valid$classe)$overall[1]) #top algo combined model
+paste("All algorithm fit accuracy:",confusionMatrix(predict(bigcomb,val.df),valid$classe)$overall[1]) #all algo combined model
+
+stopCluster(cl)
+```
+Interestingly the GBM and SVMR models which performed slightly worse than RF had no effect on the model accuracy, but the inclusion of the poorly performing models did have a very minor positive impact.
